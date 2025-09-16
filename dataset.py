@@ -79,7 +79,11 @@ def bin_to_sign(x):
     return 1 - 2 * x
 
 def EbN0_to_std(EbN0, rate):
-    snr =  EbN0 + 10. * np.log10(2 * rate)
+    snr =  EbN0 + 10. * np.log10(2 * rate) #SNR = Es/(N0/2) = (Eb*rate)/(N0/2)
+    #Eb = 每個「資訊 bit」的平均能量
+    #這是「編碼前」的資訊位元能量基準。
+    #Es = 每個「傳送符號 (channel symbol)」的平均能量
+    #這是「編碼後，經過調變後實際送到通道的符號能量」。
     return np.sqrt(1. / (10. ** (snr / 10.)))
 
 def BER(x_pred, x_gt):
