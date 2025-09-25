@@ -15,11 +15,11 @@ Only Phase 1 (FP32), 500 epochs:
 `python main.py --enable_p1 --epochs1 500 --code_type LDPC --n 49 --k 24 --N_dec 6 --d_model 128`
 
 ## Two-Phase Training (FP32 → QAT)
-# Phase 1 (FP32)
+### Phase 1 (FP32)
 
 `python main.py --enable_p1 --epochs1 800 --code_type LDPC --n 49 --k 24 --N_dec 6 --d_model 128`
 
-# Phase 2 (QAT)
+### Phase 2 (QAT)
 Initialize from Phase-1 checkpoint:
 
 `python main.py --enable_p2 --from_stage1 runs/<ts>/best_stage1_fp32__LDPC_n49_k24__Ndec6_d128_h8.pth --epochs2 300`
