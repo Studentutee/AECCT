@@ -239,8 +239,8 @@ def main():
     # build code matrices (loads from dataset.CODES_PATH, typically ./codes)
     code = Code(n=args_cli.n, k=args_cli.k, code_type=args_cli.code_type)
     G, H = Get_Generator_and_Parity(code, standard_form=args_cli.standardize)
-    code.generator_matrix = G
-    code.pc_matrix = H
+    code.generator_matrix = torch.from_numpy(G).transpose(0,1).long()
+    code.pc_matrix = torch.from_numpy(H).long()
     args.code = code
 
     # seed & device
