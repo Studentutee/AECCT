@@ -1,4 +1,4 @@
-# main.py  (drop-in replacement with best-ckpt + periodic test)
+# main.py  (with phase-select, resume, best-ckpt, periodic test, rich filenames)
 import os, argparse, logging
 from datetime import datetime
 import numpy as np
@@ -14,6 +14,7 @@ from dataset import (
 from models import ECC_Transformer, freeze_weights
 
 
+# ---------- helpers ----------
 def build_sigma_list(k, n, ebn0_min=3.0, ebn0_max=7.0, steps=21):
     rate = float(k) / float(n)
     ebn0s = np.linspace(ebn0_min, ebn0_max, steps)
@@ -58,8 +59,22 @@ def maybe_validate(model, device, test_loader_list, ebn0_list, epoch, val_every)
         test(model, device, test_loader_list, ebn0_list, min_FER=100)
 
 
+def fmt_ckpt_tag(args: Config) -> str:
+    """建立檔名用的模型/碼參數標籤"""
+    ct = args.code.code_type if hasattr(args, "code") and hasattr(args.code, "code_type") else "CODE"
+    n  = args.code.n if hasattr(args, "code") and hasattr(args.code, "n") else "N"
+    k  = args.code.k if hasattr(args, "code") and hasattr(args.code, "k") else "K"
+    return f"{ct}_n{n}_k{k}__Ndec{args.N_dec}_d{args.d_model}_h{args.h}"
+
+
+def fmt_el(epoch: int, loss: float) -> str:
+    """epoch+loss 標籤（for 檔名）"""
+    return f"e{epoch}_loss{loss:.6f}"
+
+
+# ---------- Stage 1 ----------
 def stage1_train(args: Config, device, resume: str, epochs1: int, outdir: str, val_every: int):
-    # ---- Stage 1: standard transformer (no AAP) ----
+    # Stage 1: standard transformer (no AAP)
     args.use_aap_linear_training = False
     args.use_aap_linear_inference = False
 
@@ -74,42 +89,54 @@ def stage1_train(args: Config, device, resume: str, epochs1: int, outdir: str, v
 
     # Track/save best
     best_loss = float("inf")
-    best_any_path = os.path.join(outdir, "best_model")               # compatible name
-    best_stage1_path = os.path.join(outdir, "best_stage1_fp32.pth")  # stage-specific
-    final_path = os.path.join(outdir, "stage1_fp32.pth")             # final snapshot
+    best_epoch = 0
+    tag = fmt_ckpt_tag(args)
+    best_any_path = os.path.join(outdir, "best_model")  # 共用名（覆蓋）
+    best_stage1_clean = os.path.join(outdir, f"best_stage1_fp32__{tag}.pth")  # 乾淨名（覆蓋）
+    final_clean = os.path.join(outdir, f"stage1_fp32__{tag}.pth")             # 最後一輪（覆蓋）
+    last_loss = None
 
     for epoch in range(1, epochs1 + 1):
         LR = optim.param_groups[0]['lr']
         loss, _, _ = train(model, device, train_loader, optim, epoch, LR, args)
         sched.step()
+        last_loss = float(loss)
 
-        # save best on-the-fly (by training loss, same as original style)
+        # save best on-the-fly (by training loss)
         if loss < best_loss:
             best_loss = float(loss)
-            logging.info(f"[P1] saving best_model with loss {best_loss:.6f}")
+            best_epoch = epoch
+            logging.info(f"[P1] saving best_model with loss {best_loss:.6f} at epoch {best_epoch}")
+            # 覆蓋：共用名 + 乾淨名
             torch.save(model.state_dict(), best_any_path)
-            torch.save(model.state_dict(), best_stage1_path)
+            torch.save(model.state_dict(), best_stage1_clean)
+            # 歷史歸檔：帶 epoch+loss
+            best_stage1_arch = os.path.join(outdir, f"best_stage1_fp32__{tag}__{fmt_el(best_epoch, best_loss)}.pth")
+            torch.save(model.state_dict(), best_stage1_arch)
 
         # periodic eval
         maybe_validate(model, device, test_loader_list, ebn0_list, epoch, val_every)
 
-    # save last epoch model
-    save_ckpt(model.state_dict(), final_path)
+    # save last epoch model（覆蓋 + 歷史）
+    save_ckpt(model.state_dict(), final_clean)
+    final_arch = os.path.join(outdir, f"stage1_fp32__{tag}__{fmt_el(epochs1, last_loss if last_loss is not None else float('nan'))}.pth")
+    save_ckpt(model.state_dict(), final_arch)
 
     # final eval
     test(model, device, test_loader_list, ebn0_list, min_FER=100)
-    return final_path
+    return final_clean
 
 
+# ---------- Stage 2 ----------
 def stage2_qat(args: Config, device, resume_from: str, resume_qat: str,
                epochs2: int, outdir: str, val_every: int):
-    # ---- Stage 2 (QAT): replace Linear with AAPLinearTraining ----
+    # Stage 2 (QAT): replace Linear with AAPLinearTraining
     args.use_aap_linear_training = True
     args.use_aap_linear_inference = False
 
     qat_model = ECC_Transformer(args).to(device)
 
-    # init from Stage-1 FP32 (strict=False because AAP adds delta etc.)
+    # init from Stage-1 FP32（strict=False 因為 AAP 多 delta 等參數）
     if resume_from:
         load_ckpt_if_any(qat_model, resume_from, strict=False)
     # resume from Stage-2 (QAT) ckpt
@@ -124,44 +151,59 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str,
 
     # Track/save best
     best_loss = float("inf")
-    best_any_path = os.path.join(outdir, "best_model")            # overwrite latest best
-    best_qat_path = os.path.join(outdir, "best_stage2_qat.pth")   # stage-specific
-    qat_final_path = os.path.join(outdir, "stage2_qat.pth")       # final snapshot
+    best_epoch = 0
+    tag = fmt_ckpt_tag(args)
+    best_any_path = os.path.join(outdir, "best_model")                     # 共用名（覆蓋）
+    best_qat_clean = os.path.join(outdir, f"best_stage2_qat__{tag}.pth")   # 乾淨名（覆蓋）
+    qat_final_clean = os.path.join(outdir, f"stage2_qat__{tag}.pth")       # 最後一輪（覆蓋）
+    last_loss = None
 
     for epoch in range(1, epochs2 + 1):
         LR = optim.param_groups[0]['lr']
         loss, _, _ = train(qat_model, device, train_loader, optim, epoch, LR, args)
         sched.step()
+        last_loss = float(loss)
 
         if loss < best_loss:
             best_loss = float(loss)
-            logging.info(f"[P2] saving best_model (QAT) with loss {best_loss:.6f}")
+            best_epoch = epoch
+            logging.info(f"[P2] saving best_model (QAT) with loss {best_loss:.6f} at epoch {best_epoch}")
+            # 覆蓋：共用名 + 乾淨名
             torch.save(qat_model.state_dict(), best_any_path)
-            torch.save(qat_model.state_dict(), best_qat_path)
+            torch.save(qat_model.state_dict(), best_qat_clean)
+            # 歷史歸檔
+            best_qat_arch = os.path.join(outdir, f"best_stage2_qat__{tag}__{fmt_el(best_epoch, best_loss)}.pth")
+            torch.save(qat_model.state_dict(), best_qat_arch)
 
         # periodic eval
         maybe_validate(qat_model, device, test_loader_list, ebn0_list, epoch, val_every)
 
-    # save last epoch model
-    save_ckpt(qat_model.state_dict(), qat_final_path)
+    # save last epoch model（覆蓋 + 歷史）
+    save_ckpt(qat_model.state_dict(), qat_final_clean)
+    qat_final_arch = os.path.join(outdir, f"stage2_qat__{tag}__{fmt_el(epochs2, last_loss if last_loss is not None else float('nan'))}.pth")
+    save_ckpt(qat_model.state_dict(), qat_final_arch)
 
     # Switch to inference (AAPLinearInference) and freeze ternary weights
     args.use_aap_linear_training = False
     args.use_aap_linear_inference = True
     infer_model = ECC_Transformer(args).to(device)
-    load_ckpt_if_any(infer_model, qat_final_path, strict=False)
+    load_ckpt_if_any(infer_model, qat_final_clean, strict=False)
     freeze_weights(infer_model, args)  # quantize to {-1,0,1}, set s_w
-    infer_path = os.path.join(outdir, "stage2_infer_frozen.pth")
+    infer_path = os.path.join(
+        outdir,
+        f"stage2_infer_frozen__{tag}__{fmt_el(best_epoch if best_epoch>0 else epochs2, best_loss if best_loss < float('inf') else (last_loss if last_loss is not None else float('nan')))}.pth"
+    )
     save_ckpt(infer_model.state_dict(), infer_path)
 
     # final eval with frozen inference model
     test(infer_model, device, test_loader_list, ebn0_list, min_FER=100)
-    return qat_final_path, infer_path
+    return qat_final_clean, infer_path
 
 
+# ---------- main ----------
 def main():
     parser = argparse.ArgumentParser(description="AECCT Training (phase-select, resume, epochs)")
-    # ---- code settings ----
+    # code settings
     parser.add_argument("--code_type", type=str, default="LDPC",
                         choices=["LDPC", "POLAR", "BCH", "CCSDS", "MACKAY"])
     parser.add_argument("--n", type=int, default=49)
@@ -169,7 +211,7 @@ def main():
     parser.add_argument("--standardize", action="store_true",
                         help="use standard form for parity (if supported)")
 
-    # ---- model & train config (kept compatible with Config) ----
+    # model & train config
     parser.add_argument("--N_dec", type=int, default=10)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--h", type=int, default=8)
@@ -180,36 +222,31 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--eta_min", type=float, default=1e-6)
 
-    # ---- NEW: phase selection (multi-select) & epochs ----
+    # phase selection & epochs
     parser.add_argument("--enable_p1", action="store_true", help="run Phase 1 (FP32) training")
     parser.add_argument("--enable_p2", action="store_true", help="run Phase 2 (QAT) training")
     parser.add_argument("--epochs1", type=int, default=0, help="epochs for Phase 1 (override)")
     parser.add_argument("--epochs2", type=int, default=0, help="epochs for Phase 2 (override)")
 
-    # ---- NEW: periodic validation ----
-    parser.add_argument("--val_every", type=int, default=200,
-                        help="run test() every N epochs (0=disable)")
+    # periodic validation
+    parser.add_argument("--val_every", type=int, default=200, help="run test() every N epochs (0=disable)")
 
-    # ---- NEW: resume controls ----
-    parser.add_argument("--resume1", type=str, default="",
-                        help="checkpoint path to resume Phase 1")
-    parser.add_argument("--resume2", type=str, default="",
-                        help="checkpoint path to resume Phase 2 (QAT)")
-    parser.add_argument("--from_stage1", type=str, default="",
-                        help="use this Stage-1 ckpt to init Stage-2")
+    # resume controls
+    parser.add_argument("--resume1", type=str, default="", help="checkpoint path to resume Phase 1")
+    parser.add_argument("--resume2", type=str, default="", help="checkpoint path to resume Phase 2 (QAT)")
+    parser.add_argument("--from_stage1", type=str, default="", help="use this Stage-1 ckpt to init Stage-2")
 
-    # ---- misc ----
-    parser.add_argument("--outdir", type=str, default="runs",
-                        help="output dir for checkpoints & logs")
+    # output root
+    parser.add_argument("--outdir", type=str, default="runs", help="output dir for checkpoints & logs")
 
     args_cli = parser.parse_args()
 
-    # Default behavior: if neither specified, run both
+    # default: run both if neither specified
     if not (args_cli.enable_p1 or args_cli.enable_p2):
         args_cli.enable_p1 = True
         args_cli.enable_p2 = True
 
-    # Prepare logging
+    # logging
     os.makedirs(args_cli.outdir, exist_ok=True)
     timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(args_cli.outdir, f"train_{timestr}.log")
@@ -232,14 +269,15 @@ def main():
     args.eta_min = args_cli.eta_min
     args.standardize = args_cli.standardize
 
-    # Save path under outdir
+    # save path
     args.path = os.path.join(args_cli.outdir, timestr)
     os.makedirs(args.path, exist_ok=True)
 
     # build code matrices (loads from dataset.CODES_PATH, typically ./codes)
     code = Code(n=args_cli.n, k=args_cli.k, code_type=args_cli.code_type)
     G, H = Get_Generator_and_Parity(code, standard_form=args_cli.standardize)
-    code.generator_matrix = torch.from_numpy(G).transpose(0,1).long()
+    # 與原版一致：存成 long（相容索引/遮罩），G 轉置成列向量在前
+    code.generator_matrix = torch.from_numpy(G).transpose(0, 1).long()
     code.pc_matrix = torch.from_numpy(H).long()
     args.code = code
 
@@ -248,11 +286,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"Device: {device}")
 
-    # Resolve effective epochs
-    epochs1 = args_cli.epochs1 if args_cli.epochs1 > 0 else 1000  # project default
-    epochs2 = args_cli.epochs2 if args_cli.epochs2 > 0 else 1000  # project default
+    # epochs
+    epochs1 = args_cli.epochs1 if args_cli.epochs1 > 0 else 1000
+    epochs2 = args_cli.epochs2 if args_cli.epochs2 > 0 else 1000
 
-    # Run phases as requested
+    # run
     p1_ckpt = ""
     if args_cli.enable_p1:
         p1_ckpt = stage1_train(
