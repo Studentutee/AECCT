@@ -190,46 +190,66 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
     t = time.time()
     with torch.no_grad():
         for ii, test_loader in enumerate(test_loader_list):
-            test_loss = test_ber = test_fer = cum_count = 0.
-            while True:
-                (m, x, z, y, magnitude, syndrome) = next(iter(test_loader))
-                z_mul = (y * bin_to_sign(x))
-                z_pred = model(magnitude.to(device), syndrome.to(device))
-                loss, x_pred = model.loss(-z_pred, z_mul.to(device), y.to(device))
+            test_loss = test_ber = test_fer = cum_count = 0.0
 
-                test_loss += loss.item() * x.shape[0]
+            # 以「錯誤數」為目標的進度條（會累加到 min_FER 就完成）
+            # min_FER<=0 時，不設 total，僅顯示即時速率
+            pbar_total = int(min_FER) if (min_FER and min_FER > 0) else None
+            pbar = tqdm(total=pbar_total, desc=f"Eval Eb/N0={EbNo_range_test[ii]} dB",
+                        unit="err", leave=False)
 
-                test_ber += BER(x_pred, x.to(device)) * x.shape[0]
-                test_fer += FER(x_pred, x.to(device)) * x.shape[0]
-                cum_count += x.shape[0]
-                if (min_FER > 0 and test_fer > min_FER and cum_count > 1e5) or cum_count >= 1e9:
-                    if cum_count >= 1e9:
-                        logging.info(f'Number of samples threshold reached for EbN0:{EbNo_range_test[ii]}')
-                    else:
-                        logging.info(f'FER count threshold reached for EbN0:{EbNo_range_test[ii]}')
-                    break
+            stop = False
+            while not stop:
+                # 正常走完整個 DataLoader；跑完一輪還沒達標就再來一輪
+                for m, x, z, y, magnitude, syndrome in test_loader:
+                    # 搬到裝置
+                    magnitude = magnitude.to(device, non_blocking=True)
+                    syndrome  = syndrome.to(device, non_blocking=True)
+                    y         = y.to(device, non_blocking=True)
+                    x_dev     = x.to(device, non_blocking=True)
+
+                    z_mul = (y * bin_to_sign(x_dev))
+                    z_pred = model(magnitude, syndrome)
+                    loss, x_pred = model.loss(-z_pred, z_mul, y)
+
+                    # 累加 metrics（以「樣本數」做加權）
+                    bs = x.shape[0]
+                    test_loss += loss.item() * bs
+                    ber_batch = BER(x_pred, x_dev)
+                    fer_batch = FER(x_pred, x_dev)          # 比例
+                    test_ber += ber_batch * bs              # 轉成「錯誤樣本數」
+                    test_fer += fer_batch * bs              # 轉成「錯誤 frame 數」
+                    cum_count += bs
+
+                    # 以「錯誤 frame 數」更新進度條
+                    pbar.update(int(round(fer_batch * bs)))
+
+                    # 停止條件（與原版相同邏輯）
+                    if ((min_FER > 0 and test_fer > min_FER and cum_count > 1e5) or
+                        cum_count >= 1e9):
+                        if cum_count >= 1e9:
+                            logging.info(f'Number of samples threshold reached for EbN0:{EbNo_range_test[ii]}')
+                        else:
+                            logging.info(f'FER count threshold reached for EbN0:{EbNo_range_test[ii]}')
+                        stop = True
+                        break
+                # 跑完整個 loader 後，若還沒達標就自動再跑下一輪（while 會再迭代一次）
+            pbar.close()
+
             cum_samples_all.append(cum_count)
             test_loss_list.append(test_loss / cum_count)
-            test_loss_ber_list.append(test_ber / cum_count)
-            test_loss_fer_list.append(test_fer / cum_count)
+            test_loss_ber_list.append(test_ber / cum_count)  # 轉回比例
+            test_loss_fer_list.append(test_fer / cum_count)  # 轉回比例
             logging.info(f'Test EbN0={EbNo_range_test[ii]}, BER={test_loss_ber_list[-1]:.2e}')
-        ###
+
         logging.info('\nTest Loss ' + ' '.join(
-            ['{}: {:.4e}'.format(ebno, elem) for (elem, ebno)
-             in
-             (zip(test_loss_list, EbNo_range_test))]))
+            ['{}: {:.4e}'.format(ebno, elem) for (elem, ebno) in zip(test_loss_list, EbNo_range_test)]))
         logging.info('Test FER ' + ' '.join(
-            ['{}: {:.4e}'.format(ebno, elem) for (elem, ebno)
-             in
-             (zip(test_loss_fer_list, EbNo_range_test))]))
+            ['{}: {:.4e}'.format(ebno, elem) for (elem, ebno) in zip(test_loss_fer_list, EbNo_range_test)]))
         logging.info('Test BER ' + ' '.join(
-            ['{}: {:.4e}'.format(ebno, elem) for (elem, ebno)
-             in
-             (zip(test_loss_ber_list, EbNo_range_test))]))
+            ['{}: {:.4e}'.format(ebno, elem) for (elem, ebno) in zip(test_loss_ber_list, EbNo_range_test)]))
         logging.info('Test -ln(BER) ' + ' '.join(
-            ['{}: {:.4e}'.format(ebno, -np.log(elem)) for (elem, ebno)
-             in
-             (zip(test_loss_ber_list, EbNo_range_test))]))
+            ['{}: {:.4e}'.format(ebno, -np.log(elem)) for (elem, ebno) in zip(test_loss_ber_list, EbNo_range_test)]))
 
     logging.info(f'# of testing samples: {cum_samples_all}\n Test Time {time.time() - t} s\n')
     return test_loss_list, test_loss_ber_list, test_loss_fer_list

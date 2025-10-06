@@ -56,11 +56,11 @@ def load_ckpt_if_any(model: torch.nn.Module, ckpt_path: str, strict=True):
 def maybe_validate(model, device, test_loader_list, ebn0_list, epoch, val_every):
     if val_every > 0 and epoch % val_every == 0:
         logging.info(f"[Eval] epoch {epoch}: running test at Eb/N0 {ebn0_list}")
-        test(model, device, test_loader_list, ebn0_list, min_FER=100)
+        test(model, device, wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix=f"Eval e{epoch}"),  ebn0_list, min_FER=100)
 
 
 def fmt_ckpt_tag(args: Config) -> str:
-    """建立檔名用的模型/碼參數標籤"""
+    #建立檔名用的模型/碼參數標籤
     ct = args.code.code_type if hasattr(args, "code") and hasattr(args.code, "code_type") else "CODE"
     n  = args.code.n if hasattr(args, "code") and hasattr(args.code, "n") else "N"
     k  = args.code.k if hasattr(args, "code") and hasattr(args.code, "k") else "K"
@@ -71,6 +71,25 @@ def fmt_el(epoch: int, loss: float) -> str:
     """epoch+loss 標籤（for 檔名）"""
     return f"e{epoch}_loss{loss:.6f}"
 
+def wrap_loaders_with_tqdm(loaders, ebn0_list, prefix="Eval"):
+    #把每個測試 DataLoader 包一層 tqdm；dataset.test() 仍照常 for loader: ...
+    #你會在主控台看到每個 Eb/N0 的進度列（單位 batch/s）。
+    wrapped = []
+    for loader, eb in zip(loaders, ebn0_list):
+        desc = f"{prefix} Eb/N0={eb}dB"
+        class _TQDMWrapper:
+            def __init__(self, base, desc):
+                self.base = base
+                self.desc = desc
+            def __len__(self):
+                return len(self.base)
+            def __iter__(self):
+                from tqdm import tqdm
+                # leave=False 讓進度列在完成時自動清掉，避免刷屏；想保留可改成 True
+                for item in tqdm(self.base, total=len(self.base), desc=self.desc, unit="batch", leave=False):
+                    yield item
+        wrapped.append(_TQDMWrapper(loader, desc))
+    return wrapped
 
 # ---------- Stage 1 ----------
 def stage1_train(args: Config, device, resume: str, epochs1: int, outdir: str, val_every: int):
@@ -123,7 +142,7 @@ def stage1_train(args: Config, device, resume: str, epochs1: int, outdir: str, v
     save_ckpt(model.state_dict(), final_arch)
 
     # final eval
-    test(model, device, test_loader_list, ebn0_list, min_FER=100)
+    test(model, device, wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix="Final P1"), ebn0_list, min_FER=100)
     return final_clean
 
 
@@ -196,7 +215,7 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str,
     save_ckpt(infer_model.state_dict(), infer_path)
 
     # final eval with frozen inference model
-    test(infer_model, device, test_loader_list, ebn0_list, min_FER=100)
+    test(infer_model, device, wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix="Final P2"), ebn0_list, min_FER=100)
     return qat_final_clean, infer_path
 
 
@@ -229,7 +248,7 @@ def main():
     parser.add_argument("--epochs2", type=int, default=0, help="epochs for Phase 2 (override)")
 
     # periodic validation
-    parser.add_argument("--val_every", type=int, default=200, help="run test() every N epochs (0=disable)")
+    parser.add_argument("--val_every", type=int, default=0, help="run test() every N epochs (0=disable)")
 
     # resume controls
     parser.add_argument("--resume1", type=str, default="", help="checkpoint path to resume Phase 1")
