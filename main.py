@@ -12,6 +12,7 @@ from dataset import (
     ECC_Dataset, train, test, set_seed, Get_Generator_and_Parity, EbN0_to_std
 )
 from models import ECC_Transformer, freeze_weights
+from trace_utils import ActivationTracer, install_encoder_hooks
 
 
 # ---------- helpers ----------
@@ -53,10 +54,10 @@ def load_ckpt_if_any(model: torch.nn.Module, ckpt_path: str, strict=True):
         logging.warning(f"[resume] File not found: {ckpt_path} (skipped)")
 
 
-def maybe_validate(model, device, test_loader_list, ebn0_list, epoch, val_every):
+def maybe_validate(model, device, test_loader_list, ebn0_list, epoch, val_every, tracer=None):
     if val_every > 0 and epoch % val_every == 0:
         logging.info(f"[Eval] epoch {epoch}: running test at Eb/N0 {ebn0_list}")
-        test(model, device, wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix=f"Eval e{epoch}"),  ebn0_list, min_FER=100)
+        test(model, device, wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix=f"Eval e{epoch}"), ebn0_list, min_FER=100, tracer=tracer)
 
 
 def fmt_ckpt_tag(args: Config) -> str:
@@ -147,8 +148,7 @@ def stage1_train(args: Config, device, resume: str, epochs1: int, outdir: str, v
 
 
 # ---------- Stage 2 ----------
-def stage2_qat(args: Config, device, resume_from: str, resume_qat: str,
-               epochs2: int, outdir: str, val_every: int):
+def stage2_qat(args: Config, device, resume_from: str, resume_qat: str, epochs2: int, outdir: str, val_every: int):
     # Stage 2 (QAT): replace Linear with AAPLinearTraining
     args.use_aap_linear_training = True
     args.use_aap_linear_inference = False
@@ -159,8 +159,26 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str,
     if resume_from:
         load_ckpt_if_any(qat_model, resume_from, strict=False)
     # resume from Stage-2 (QAT) ckpt
+    # --- 判斷 --resume2 指向的到底是 QAT 還是 Frozen-Infer 權重 ---
+    is_infer_ckpt = False
+    sd = None
     if resume_qat:
+        sd = torch.load(resume_qat, map_location="cpu")
+        # 看到任何 *.s_w 代表這是 Frozen-Infer 權重（AAPLinearInference）
+        is_infer_ckpt = any("s_w" in k for k in sd.keys())
+    
+    if epochs2 > 0 and is_infer_ckpt:
+        logging.warning(
+            "[P2] --resume2 points to a Frozen-Infer checkpoint; "
+            "it cannot be used for QAT initialization. "
+            "QAT will be skipped and only inference mode will run."
+        )
+
+    # (A) 若是 QAT ckpt → 照舊載到 qat_model（訓練版 AAPLinearTraining 需要 *.delta）
+    if resume_qat and (not is_infer_ckpt):
         load_ckpt_if_any(qat_model, resume_qat, strict=True)
+    # --------------------------------------------------------------
+
 
     train_loader, test_loader_list, ebn0_list = make_dataloaders(
         args, runlen_train=args.batch_size * 1000, ebn0_test_list=(4, 5, 6)
@@ -206,7 +224,12 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str,
     args.use_aap_linear_training = False
     args.use_aap_linear_inference = True
     infer_model = ECC_Transformer(args).to(device)
-    load_ckpt_if_any(infer_model, qat_final_clean, strict=False)
+    # --- 若 --resume2 是 Frozen-Infer ckpt（含 *.s_w）→ 直接載到 infer_model
+    if 'is_infer_ckpt' in locals() and is_infer_ckpt:
+        infer_model.load_state_dict(sd, strict=False)
+    else:
+        # 正常路徑：從最新的 QAT ckpt 轉到推論模型
+        load_ckpt_if_any(infer_model, qat_final_clean, strict=False)
     freeze_weights(infer_model, args)  # quantize to {-1,0,1}, set s_w
     infer_path = os.path.join(
         outdir,
@@ -214,10 +237,24 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str,
     )
     save_ckpt(infer_model.state_dict(), infer_path)
 
-    # final eval with frozen inference model
-    test(infer_model, device, wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix="Final P2"), ebn0_list, min_FER=100)
-    return qat_final_clean, infer_path
+    # 只追最終推論模型
+    tracer_inf = None
+    if args.trace:
+        trace_dir_inf = args.trace_dir or os.path.join(args.path, "trace_infer")
+        tracer_inf = ActivationTracer(
+            save_dir=trace_dir_inf,
+            sample_raw_every=args.trace_sample_raw_every,  # >0 才會存原始樣本
+            sample_merge=False #（多個 step 檔案）
+        )
+    install_encoder_hooks(infer_model, tracer_inf)
 
+    # final eval with frozen inference model
+    test(infer_model, device, test_loader_list, ebn0_list, min_FER=100, tracer=tracer_inf)
+   
+    # 測完一次，輸出統計檔
+    if tracer_inf is not None:
+        tracer_inf.dump(tag=args.trace_tag or "stage2_infer")
+    return qat_final_clean, infer_path
 
 # ---------- main ----------
 def main():
@@ -257,6 +294,15 @@ def main():
 
     # output root
     parser.add_argument("--outdir", type=str, default="runs", help="output dir for checkpoints & logs")
+
+    parser.add_argument("--trace", action="store_true",
+                        help="Enable activation tracing during test/infer.")
+    parser.add_argument("--trace_dir", type=str, default=None,
+                        help="Where to save trace outputs (default: <args.path>/trace_[mode]).")
+    parser.add_argument("--trace_sample_raw_every", type=int, default=0,
+                        help="Save raw tensors every N batches (0=disable).")
+    parser.add_argument("--trace_tag", type=str, default=None,
+                        help="Optional tag for trace summary file name.")
 
     args_cli = parser.parse_args()
 
@@ -306,8 +352,13 @@ def main():
     logging.info(f"Device: {device}")
 
     # epochs
-    epochs1 = args_cli.epochs1 if args_cli.epochs1 > 0 else 1000
-    epochs2 = args_cli.epochs2 if args_cli.epochs2 > 0 else 1000
+    epochs1 = args_cli.epochs1 #if args_cli.epochs1 > 0 else 1000
+    epochs2 = args_cli.epochs2 #if args_cli.epochs2 > 0 else 1000
+
+    args.trace = getattr(args_cli, "trace", False)
+    args.trace_dir = getattr(args_cli, "trace_dir", None)
+    args.trace_tag = getattr(args_cli, "trace_tag", None)
+    args.trace_sample_raw_every = getattr(args_cli, "trace_sample_raw_every", 0)
 
     # run
     p1_ckpt = ""

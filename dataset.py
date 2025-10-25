@@ -184,7 +184,7 @@ def train(model, device, train_loader, optimizer, epoch, LR, config: Config):
     return cum_loss / cum_samples, cum_ber / cum_samples, cum_fer / cum_samples
 
 
-def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
+def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=None):
     model.eval()
     test_loss_list, test_loss_ber_list, test_loss_fer_list, cum_samples_all = [], [], [], []
     t = time.time()
@@ -202,15 +202,35 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
             while not stop:
                 # 正常走完整個 DataLoader；跑完一輪還沒達標就再來一輪
                 for m, x, z, y, magnitude, syndrome in test_loader:
-                    # 搬到裝置
                     magnitude = magnitude.to(device, non_blocking=True)
                     syndrome  = syndrome.to(device, non_blocking=True)
                     y         = y.to(device, non_blocking=True)
                     x_dev     = x.to(device, non_blocking=True)
 
+                    # ---- 只在 infer 需要時才記錄（tracer 有傳進來才會執行）----
+                    if tracer is not None:
+                        tracer.log("input/abs_y", magnitude)
+                        tracer.log("input/syndrome", syndrome)
+                        tracer.log("input/y", y)  # 要的話也可一起記
+
+                        # 依 models.ECC_Transformer.forward 的前兩步重建 node_embed 與 +SPE
+                        emb0 = torch.cat([magnitude, syndrome], dim=-1).unsqueeze(-1)   # (B, 2n-k, 1)
+                        node_embed = model.src_embed.unsqueeze(0) * emb0                # (B, 2n-k, emb_dim)
+                        tracer.log("embed/node_embed", node_embed)
+
+                        lpe = model.lpe_proj(model.lpe)
+                        lpe = model.attn_lpe(lpe).unsqueeze(0)                           # (1, 2n-k, d_lpe)
+                        bached_lpe = lpe.expand(node_embed.size(0), lpe.size(1), lpe.size(2))
+                        embed_plus_spe = torch.cat([node_embed, bached_lpe], dim=-1)     # (B, 2n-k, d_model)
+                        tracer.log("embed/plus_SPE", embed_plus_spe)
+                    # ------------------------------------------------------------
+
                     z_mul = (y * bin_to_sign(x_dev))
                     z_pred = model(magnitude, syndrome)
                     loss, x_pred = model.loss(-z_pred, z_mul, y)
+
+                    if tracer is not None:
+                        tracer.step()
 
                     # 累加 metrics（以「樣本數」做加權）
                     bs = x.shape[0]
