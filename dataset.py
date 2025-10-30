@@ -1,3 +1,4 @@
+
 import numpy as np
 import torch
 import os
@@ -10,6 +11,14 @@ from tqdm import tqdm
 
 from configuration import Config
 
+# FP8 native helpers
+try:
+    from te_fp8_utils import is_te_available, build_fp8_recipe, convert_linear_to_te, fp8_context
+except Exception as _e:
+    is_te_available = None
+    build_fp8_recipe = None
+    convert_linear_to_te = None
+    fp8_context = None
 
 CODES_PATH = "codes/"
 
@@ -79,11 +88,7 @@ def bin_to_sign(x):
     return 1 - 2 * x
 
 def EbN0_to_std(EbN0, rate):
-    snr =  EbN0 + 10. * np.log10(2 * rate) #SNR = Es/(N0/2) = (Eb*rate)/(N0/2)
-    #Eb = 每個「資訊 bit」的平均能量
-    #這是「編碼前」的資訊位元能量基準。
-    #Es = 每個「傳送符號 (channel symbol)」的平均能量
-    #這是「編碼後，經過調變後實際送到通道的符號能量」。
+    snr =  EbN0 + 10. * np.log10(2 * rate)
     return np.sqrt(1. / (10. ** (snr / 10.)))
 
 def BER(x_pred, x_gt):
@@ -184,67 +189,125 @@ def train(model, device, train_loader, optimizer, epoch, LR, config: Config):
     return cum_loss / cum_samples, cum_ber / cum_samples, cum_fer / cum_samples
 
 
-def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=None):
+def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=None,
+         precision: str = "fp32", measure_tp: bool = False, warmup: int = 10,
+         tp_include_loss: bool = False, fp8_native: bool = False):
+    """
+    precision: fp32 | fp16 | bf16 | int8 | e5m2 | e4m3
+    measure_tp: only measure GPU forward (+hard decision) using CUDA events.
+    warmup: number of batches ignored for throughput stats.
+    tp_include_loss: include loss in timing window (default False).
+    fp8_native: if True and precision in {e5m2,e4m3}, require TransformerEngine and use native FP8.
+    """
     model.eval()
+
+    # ---- Precision contexts ----
+    use_amp = precision in ("fp16", "bf16")
+    amp_dtype = torch.float16 if precision == "fp16" else (torch.bfloat16 if precision == "bf16" else None)
+    use_fp8 = precision in ("e5m2", "e4m3")
+    fp8_recipe = None
+
+    # Native FP8 setup (one-time conversion)
+    if use_fp8:
+        if not fp8_native:
+            raise RuntimeError("Requested FP8 precision but --fp8_native is False. Set --fp8_native to enable native FP8 (TransformerEngine).")
+        if is_te_available is None:
+            raise RuntimeError("TransformerEngine helpers not importable. Ensure te_fp8_utils.py is present.")
+        ok, err = is_te_available()
+        if not ok:
+            raise RuntimeError(f"TransformerEngine not available: {err}")
+        # convert Linear -> TE Linear only if not already converted
+        if not getattr(model, "_te_converted", False):
+            convert_linear_to_te(model)
+            setattr(model, "_te_converted", True)
+        fp8_recipe = build_fp8_recipe(precision)
+
     test_loss_list, test_loss_ber_list, test_loss_fer_list, cum_samples_all = [], [], [], []
     t = time.time()
+
+    # Throughput accumulators
+    total_ms = 0.0
+    total_samples_for_tp = 0
+    seen_batches = 0
+    start_ev = torch.cuda.Event(enable_timing=True) if (measure_tp and torch.cuda.is_available()) else None
+    end_ev   = torch.cuda.Event(enable_timing=True) if (measure_tp and torch.cuda.is_available()) else None
+
     with torch.no_grad():
         for ii, test_loader in enumerate(test_loader_list):
             test_loss = test_ber = test_fer = cum_count = 0.0
 
-            # 以「錯誤數」為目標的進度條（會累加到 min_FER 就完成）
-            # min_FER<=0 時，不設 total，僅顯示即時速率
             pbar_total = int(min_FER) if (min_FER and min_FER > 0) else None
             pbar = tqdm(total=pbar_total, desc=f"Eval Eb/N0={EbNo_range_test[ii]} dB",
                         unit="err", leave=False)
 
             stop = False
             while not stop:
-                # 正常走完整個 DataLoader；跑完一輪還沒達標就再來一輪
                 for m, x, z, y, magnitude, syndrome in test_loader:
                     magnitude = magnitude.to(device, non_blocking=True)
                     syndrome  = syndrome.to(device, non_blocking=True)
                     y         = y.to(device, non_blocking=True)
                     x_dev     = x.to(device, non_blocking=True)
 
-                    # ---- 只在 infer 需要時才記錄（tracer 有傳進來才會執行）----
                     if tracer is not None:
                         tracer.log("input/abs_y", magnitude)
                         tracer.log("input/syndrome", syndrome)
-                        tracer.log("input/y", y)  # 要的話也可一起記
+                        tracer.log("input/y", y)
 
-                        # 依 models.ECC_Transformer.forward 的前兩步重建 node_embed 與 +SPE
-                        emb0 = torch.cat([magnitude, syndrome], dim=-1).unsqueeze(-1)   # (B, 2n-k, 1)
-                        node_embed = model.src_embed.unsqueeze(0) * emb0                # (B, 2n-k, emb_dim)
+                        emb0 = torch.cat([magnitude, syndrome], dim=-1).unsqueeze(-1)
+                        node_embed = model.src_embed.unsqueeze(0) * emb0
                         tracer.log("embed/node_embed", node_embed)
 
                         lpe = model.lpe_proj(model.lpe)
-                        lpe = model.attn_lpe(lpe).unsqueeze(0)                           # (1, 2n-k, d_lpe)
+                        lpe = model.attn_lpe(lpe).unsqueeze(0)
                         bached_lpe = lpe.expand(node_embed.size(0), lpe.size(1), lpe.size(2))
-                        embed_plus_spe = torch.cat([node_embed, bached_lpe], dim=-1)     # (B, 2n-k, d_model)
+                        embed_plus_spe = torch.cat([node_embed, bached_lpe], dim=-1)
                         tracer.log("embed/plus_SPE", embed_plus_spe)
-                    # ------------------------------------------------------------
 
+                    # ---- Timing window: ONLY forward (+ optional loss) ----
+                    if start_ev is not None:
+                        torch.cuda.synchronize()
+                        start_ev.record()
+
+                    if use_fp8:
+                        with fp8_context(fp8_recipe):
+                            z_pred = model(magnitude, syndrome)
+                    elif use_amp:
+                        with torch.cuda.amp.autocast(dtype=amp_dtype):
+                            z_pred = model(magnitude, syndrome)
+                    else:
+                        z_pred = model(magnitude, syndrome)
+
+                    # Produce x_pred for metrics (hard decision). Loss optional.
                     z_mul = (y * bin_to_sign(x_dev))
-                    z_pred = model(magnitude, syndrome)
-                    loss, x_pred = model.loss(-z_pred, z_mul, y)
+                    if tp_include_loss:
+                        loss, x_pred = model.loss(-z_pred, z_mul, y)
+                    else:
+                        # mimic model.loss's x_pred branch without computing BCE
+                        x_pred = ( -z_pred * torch.sign(y) > 0 ).float()
+
+                    if end_ev is not None:
+                        end_ev.record()
+                        torch.cuda.synchronize()
+                        if seen_batches >= warmup:
+                            total_ms += start_ev.elapsed_time(end_ev)
+                            total_samples_for_tp += x.shape[0]
+                        seen_batches += 1
 
                     if tracer is not None:
                         tracer.step()
 
-                    # 累加 metrics（以「樣本數」做加權）
+                    # ---- Metrics accumulation (outside timing) ----
                     bs = x.shape[0]
-                    test_loss += loss.item() * bs
+                    if tp_include_loss:
+                        test_loss += loss.item() * bs
                     ber_batch = BER(x_pred, x_dev)
-                    fer_batch = FER(x_pred, x_dev)          # 比例
-                    test_ber += ber_batch * bs              # 轉成「錯誤樣本數」
-                    test_fer += fer_batch * bs              # 轉成「錯誤 frame 數」
+                    fer_batch = FER(x_pred, x_dev)
+                    test_ber += ber_batch * bs
+                    test_fer += fer_batch * bs
                     cum_count += bs
 
-                    # 以「錯誤 frame 數」更新進度條
                     pbar.update(int(round(fer_batch * bs)))
 
-                    # 停止條件（與原版相同邏輯）
                     if ((min_FER > 0 and test_fer > min_FER and cum_count > 1e5) or
                         cum_count >= 1e9):
                         if cum_count >= 1e9:
@@ -253,13 +316,12 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=N
                             logging.info(f'FER count threshold reached for EbN0:{EbNo_range_test[ii]}')
                         stop = True
                         break
-                # 跑完整個 loader 後，若還沒達標就自動再跑下一輪（while 會再迭代一次）
             pbar.close()
 
             cum_samples_all.append(cum_count)
-            test_loss_list.append(test_loss / cum_count)
-            test_loss_ber_list.append(test_ber / cum_count)  # 轉回比例
-            test_loss_fer_list.append(test_fer / cum_count)  # 轉回比例
+            test_loss_list.append((test_loss / cum_count) if tp_include_loss else 0.0)
+            test_loss_ber_list.append(test_ber / cum_count)
+            test_loss_fer_list.append(test_fer / cum_count)
             logging.info(f'Test EbN0={EbNo_range_test[ii]}, BER={test_loss_ber_list[-1]:.2e}')
 
         logging.info('\nTest Loss ' + ' '.join(
@@ -270,6 +332,13 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=N
             ['{}: {:.4e}'.format(ebno, elem) for (elem, ebno) in zip(test_loss_ber_list, EbNo_range_test)]))
         logging.info('Test -ln(BER) ' + ' '.join(
             ['{}: {:.4e}'.format(ebno, -np.log(elem)) for (elem, ebno) in zip(test_loss_ber_list, EbNo_range_test)]))
+
+    if measure_tp and total_ms > 0:
+        secs = total_ms / 1000.0
+        sps  = total_samples_for_tp / secs
+        logging.info(f"[Throughput] GPU forward-only: {sps:.2f} samples/s "
+                     f"(ignored first {warmup} batches; "
+                     f"{'incl. loss' if tp_include_loss else 'excl. loss'})")
 
     logging.info(f'# of testing samples: {cum_samples_all}\n Test Time {time.time() - t} s\n')
     return test_loss_list, test_loss_ber_list, test_loss_fer_list
