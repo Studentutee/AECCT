@@ -106,7 +106,8 @@ class MultiHeadedAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) \
             / math.sqrt(self.d_k)
         if mask is not None:
-            scores = scores.masked_fill(mask.bool(), -1e9)
+            # use dtype-aware minimum to avoid overflow in FP16/FP8 autocast
+            scores = scores.masked_fill(mask.bool(), torch.finfo(scores.dtype).min)
         p_attn = F.softmax(scores, dim=-1)
         if self.dropout is not None:
             p_attn = self.dropout(p_attn)

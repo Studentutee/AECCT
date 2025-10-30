@@ -272,7 +272,7 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=N
                         with fp8_context(fp8_recipe):
                             z_pred = model(magnitude, syndrome)
                     elif use_amp:
-                        with torch.cuda.amp.autocast(dtype=amp_dtype):
+                        with torch.amp.autocast('cuda', dtype=amp_dtype):
                             z_pred = model(magnitude, syndrome)
                     else:
                         z_pred = model(magnitude, syndrome)

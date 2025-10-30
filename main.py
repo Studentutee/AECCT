@@ -233,7 +233,8 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str, epochs2:
             sample_raw_every=args.trace_sample_raw_every,
             sample_merge=False
         )
-    install_encoder_hooks(infer_model, tracer_inf)
+    if tracer_inf is not None:
+        install_encoder_hooks(infer_model, tracer_inf)
 
     test(infer_model, device, test_loader_list, ebn0_list, min_FER=100, tracer=tracer_inf,
          precision=test_precision, measure_tp=measure_tp, warmup=warmup,
