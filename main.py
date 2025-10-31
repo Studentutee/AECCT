@@ -55,15 +55,16 @@ def load_ckpt_if_any(model: torch.nn.Module, ckpt_path: str, strict=True):
 
 
 def maybe_validate(model, device, test_loader_list, ebn0_list, epoch, val_every, tracer=None,
-                   test_precision="fp32", measure_tp=False, warmup=10, tp_include_loss=False,
-                   fp8_native=False):
+                    test_precision="fp32", measure_tp=False, warmup=10, tp_include_loss=False,
+                    fp8_native=False, fp32_strict=False):
     if val_every > 0 and epoch % val_every == 0:
         logging.info(f"[Eval] epoch {epoch}: running test at Eb/N0 {ebn0_list}")
         test(model, device,
-             wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix=f"Eval e{epoch}"),
-             ebn0_list, min_FER=100, tracer=tracer,
-             precision=test_precision, measure_tp=measure_tp, warmup=warmup,
-             tp_include_loss=tp_include_loss, fp8_native=fp8_native)
+            wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix=f"Eval e{epoch}"),
+            ebn0_list, min_FER=100, tracer=tracer,
+            precision=test_precision, measure_tp=measure_tp, warmup=warmup,
+            tp_include_loss=tp_include_loss, fp8_native=fp8_native,
+            fp32_strict=fp32_strict)
 
 
 def fmt_ckpt_tag(args: Config) -> str:
@@ -95,8 +96,8 @@ def wrap_loaders_with_tqdm(loaders, ebn0_list, prefix="Eval"):
 
 # ---------- Stage 1 ----------
 def stage1_train(args: Config, device, resume: str, epochs1: int, outdir: str, val_every: int,
-                 test_precision="fp32", measure_tp=False, warmup=10, tp_include_loss=False,
-                 fp8_native=False):
+                test_precision="fp32", measure_tp=False, warmup=10, tp_include_loss=False,
+                fp8_native=False, fp32_strict=False):
     args.use_aap_linear_training = False
     args.use_aap_linear_inference = False
 
@@ -133,23 +134,26 @@ def stage1_train(args: Config, device, resume: str, epochs1: int, outdir: str, v
             torch.save(model.state_dict(), best_stage1_arch)
 
         maybe_validate(model, device, test_loader_list, ebn0_list, epoch, val_every,
-                       test_precision=test_precision, measure_tp=measure_tp, warmup=warmup,
-                       tp_include_loss=tp_include_loss, fp8_native=fp8_native)
+                        test_precision=test_precision, measure_tp=measure_tp, warmup=warmup,
+                        tp_include_loss=tp_include_loss, fp8_native=fp8_native,
+                        fp32_strict=fp32_strict)
 
     save_ckpt(model.state_dict(), final_clean)
     final_arch = os.path.join(outdir, f"stage1_fp32__{tag}__{fmt_el(epochs1, last_loss if last_loss is not None else float('nan'))}.pth")
     save_ckpt(model.state_dict(), final_arch)
 
     test(model, device, wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix="Final P1"),
-         ebn0_list, min_FER=100,
-         precision=test_precision, measure_tp=measure_tp, warmup=warmup,
-         tp_include_loss=tp_include_loss, fp8_native=fp8_native)
+        ebn0_list, min_FER=100,
+        precision=test_precision, measure_tp=measure_tp, warmup=warmup,
+        tp_include_loss=tp_include_loss, fp8_native=fp8_native,
+        fp32_strict=fp32_strict)
     return final_clean
 
 
 # ---------- Stage 2 ----------
 def stage2_qat(args: Config, device, resume_from: str, resume_qat: str, epochs2: int, outdir: str, val_every: int,
-               test_precision="fp32", measure_tp=False, warmup=10, tp_include_loss=False, fp8_native=False):
+               test_precision="fp32", measure_tp=False, warmup=10, tp_include_loss=False, fp8_native=False,
+               fp32_strict=False):
     args.use_aap_linear_training = True
     args.use_aap_linear_inference = False
 
@@ -205,7 +209,8 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str, epochs2:
 
         maybe_validate(qat_model, device, test_loader_list, ebn0_list, epoch, val_every,
                        test_precision=test_precision, measure_tp=measure_tp, warmup=warmup,
-                       tp_include_loss=tp_include_loss, fp8_native=fp8_native)
+                       tp_include_loss=tp_include_loss, fp8_native=fp8_native,
+                       fp32_strict=fp32_strict)
 
     save_ckpt(qat_model.state_dict(), qat_final_clean)
     qat_final_arch = os.path.join(outdir, f"stage2_qat__{tag}__{fmt_el(epochs2, last_loss if last_loss is not None else float('nan'))}.pth")
@@ -237,9 +242,9 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str, epochs2:
         install_encoder_hooks(infer_model, tracer_inf)
 
     test(infer_model, device, test_loader_list, ebn0_list, min_FER=100, tracer=tracer_inf,
-         precision=test_precision, measure_tp=measure_tp, warmup=warmup,
-         tp_include_loss=tp_include_loss, fp8_native=fp8_native)
-
+        precision=test_precision, measure_tp=measure_tp, warmup=warmup,
+        tp_include_loss=tp_include_loss, fp8_native=fp8_native,
+        fp32_strict=fp32_strict)
     if tracer_inf is not None:
         tracer_inf.dump(tag=args.trace_tag or "stage2_infer")
     return qat_final_clean, infer_path
