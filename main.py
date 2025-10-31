@@ -304,6 +304,8 @@ def main():
                         help="Include loss computation inside timing window (default: off).")
     parser.add_argument("--fp8_native", action="store_true",
                         help="Use native FP8 (TransformerEngine) for e5m2/e4m3; error if not available.")
+    parser.add_argument("--fp32_strict", action="store_true",
+                        help="Use true FP32 (disable TF32) during test/eval.")
 
     args_cli = parser.parse_args()
 
@@ -366,6 +368,7 @@ def main():
             warmup=args_cli.warmup,
             tp_include_loss=args_cli.tp_include_loss,
             fp8_native=args_cli.fp8_native,
+            fp32_strict=args_cli.fp32_strict,
         )
 
     if args_cli.enable_p2:
@@ -382,6 +385,7 @@ def main():
             warmup=args_cli.warmup,
             tp_include_loss=args_cli.tp_include_loss,
             fp8_native=args_cli.fp8_native,
+            fp32_strict=args_cli.fp32_strict,
         )
 
     logging.info("Done.")

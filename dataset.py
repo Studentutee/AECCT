@@ -191,15 +191,34 @@ def train(model, device, train_loader, optimizer, epoch, LR, config: Config):
 
 def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=None,
          precision: str = "fp32", measure_tp: bool = False, warmup: int = 10,
-         tp_include_loss: bool = False, fp8_native: bool = False):
+         tp_include_loss: bool = False, fp8_native: bool = False,
+         fp32_strict: bool = False):
     """
     precision: fp32 | fp16 | bf16 | int8 | e5m2 | e4m3
     measure_tp: only measure GPU forward (+hard decision) using CUDA events.
     warmup: number of batches ignored for throughput stats.
     tp_include_loss: include loss in timing window (default False).
     fp8_native: if True and precision in {e5m2,e4m3}, require TransformerEngine and use native FP8.
+    fp32_strict: disable TF32 (use true FP32 math)
     """
     model.eval()
+
+    # ---- FP32 vs TF32 control (Ampere/Hopper 有效；Turing 前無效) ----
+    if precision == "fp32":
+        if fp32_strict:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.set_float32_matmul_precision("highest")  # highest = 禁用 TF32
+            logging.info("[Precision] FP32(strict) enabled: TF32 disabled.")
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")     # high = 允許 TF32
+            logging.info("[Precision] FP32(allow TF32) enabled.")
+
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            logging.info(f"[Device] capability={cap} (>=8.x has TF32).")
 
     # ---- Precision contexts ----
     use_amp = precision in ("fp16", "bf16")
