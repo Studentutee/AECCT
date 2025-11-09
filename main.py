@@ -12,7 +12,7 @@ from dataset import (
     ECC_Dataset, train, test, set_seed, Get_Generator_and_Parity, EbN0_to_std
 )
 from models import ECC_Transformer, freeze_weights
-from trace_utils import ActivationTracer, install_encoder_hooks
+from trace_utils import ActivationTracer, install_detailed_hooks
 
 
 # ---------- helpers ----------
@@ -239,7 +239,7 @@ def stage2_qat(args: Config, device, resume_from: str, resume_qat: str, epochs2:
             sample_merge=False
         )
     if tracer_inf is not None:
-        install_encoder_hooks(infer_model, tracer_inf)
+        install_detailed_hooks(infer_model, tracer_inf)
 
     test(infer_model, device, test_loader_list, ebn0_list, min_FER=100, tracer=tracer_inf,
         precision=test_precision, measure_tp=measure_tp, warmup=warmup,
