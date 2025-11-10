@@ -146,6 +146,40 @@ def install_detailed_hooks(model, tracer: "ActivationTracer"):
         attn = layer.self_attn
         ffn  = layer.feed_forward
 
+        # === 新增：記錄「進入 W_q / W_k / W_v 之前」的量化輸入 quant(x) 與 s_x（每層） ===
+        # attn.linears: [0]=W_q, [1]=W_k, [2]=W_v, [3]=W_o
+        from quantize import abs_max_quantization
+        _names = ["Wq", "Wk", "Wv"]
+        for lj, proj in enumerate(attn.linears[:3]):  # 只包前三個：Q/K/V
+            _orig_fwd = proj.forward
+            def _wrap_WqkV_forward(self_, x, li=li, lj=lj):
+                try:
+                    # 一律用 dequantize=False 取真正整數 quant(x) 與 scale s_x
+                    q_x, s_x = abs_max_quantization(x, dequantize=False, bits=getattr(self_, "act_bits", 8))
+                    tracer.log(f"layer{li}/attn/{_names[lj]}/act_q", q_x)  # 整數化的輸入（進入 W_q/W_k/W_v）
+                    tracer.log(f"layer{li}/attn/{_names[lj]}/s_x",   s_x)  # activation scale
+                except Exception:
+                    pass
+                return _orig_fwd(x)  # 照原邏輯跑
+            proj.forward = _wrap_WqkV_forward.__get__(proj, type(proj))
+
+        # === 新增：記錄「進入 W_o 之前」的量化輸入 quant(x) 與 s_x（每層一次） ===
+        # attn.linears 的順序為：lin0=Q, lin1=K, lin2=V, lin3=Out(W_o)
+        Wo = attn.linears[-1]
+        _orig_Wo_forward = Wo.forward
+        def _wrap_Wo_forward(self_, x, li=li):
+            # 不改原運算路徑；僅記錄 quant(x) 與 s_x
+            try:
+                from quantize import abs_max_quantization
+                # 一律用 dequantize=False 取得真正的整數輸入 q_x 與縮放 s_x
+                q_x, s_x = abs_max_quantization(x, dequantize=False, bits=getattr(self_, "act_bits", 8))
+                tracer.log(f"layer{li}/attn/Wo/act_q", q_x)  # 進入 W_o 的量化後輸入（整數）
+                tracer.log(f"layer{li}/attn/Wo/s_x",   s_x)  # 對應的 activation scale
+            except Exception:
+                pass
+            return _orig_Wo_forward(x)
+        Wo.forward = _wrap_Wo_forward.__get__(Wo, type(Wo))
+
         # (a) Q/K/V projection 輸出（延續舊行為）
         for idx, proj in enumerate(attn.linears[:3]):
             proj.register_forward_hook(lambda m, inp, out, li=li, idx=idx:
