@@ -89,7 +89,9 @@ class AAPLinearInference(AAPLinearTraining):
         q_x, s_x = abs_max_quantization(x, dequantize=False, bits=self.act_bits)
         
         q_out = F.linear(input=q_x, weight=q_w)
-        fp_out = q_out / (s_x * self.s_w)
-        fp_out = fp_out + self.bias
+        sw = self.s_w if self.s_w.device == q_out.device else self.s_w.to(q_out.device)
+        fp_out = q_out / (s_x * sw)
+        if self.bias is not None:
+            fp_out = fp_out + self.bias
         return fp_out
 

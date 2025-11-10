@@ -23,11 +23,20 @@ def build_sigma_list(k, n, ebn0_min=3.0, ebn0_max=7.0, steps=21):
 
 
 def make_dataloaders(args: Config, runlen_train=128000, ebn0_test_list=(4, 5, 6)):
-    # Train: zero codeword, AWGN with Eb/N0 in [3,7]
-    sigma_train = build_sigma_list(args.code.k, args.code.n, 3.0, 7.0, 21)
-    ds_train = ECC_Dataset(code=args.code, sigma=sigma_train, len=runlen_train, zero_cw=True)
-    dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.workers, pin_memory=True, drop_last=True)
+    """
+    Returns:
+        dl_train: DataLoader | None   (None when runlen_train <= 0)
+        test_loaders: list[DataLoader]
+        ebn0_test_list: tuple
+    """
+    # Train (only when runlen_train > 0)
+    if runlen_train and runlen_train > 0:
+        sigma_train = build_sigma_list(args.code.k, args.code.n, 3.0, 7.0, 21)
+        ds_train = ECC_Dataset(code=args.code, sigma=sigma_train, len=runlen_train, zero_cw=True)
+        dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.workers, pin_memory=True, drop_last=True)
+    else:
+        dl_train = None
 
     # Test: separate loaders per Eb/N0
     test_loaders = []
@@ -284,6 +293,9 @@ def main():
     parser.add_argument("--resume1", type=str, default="", help="checkpoint path to resume Phase 1")
     parser.add_argument("--resume2", type=str, default="", help="checkpoint path to resume Phase 2 (QAT)")
     parser.add_argument("--from_stage1", type=str, default="", help="use this Stage-1 ckpt to init Stage-2")
+    # evaluate a frozen inference checkpoint directly (skip P1/P2 and exit)
+    parser.add_argument("--eval_frozen", type=str, default="",
+                        help="path to stage2_infer_frozen__*.pth; load AAP inference model and run test only, then exit")
 
     # output root
     parser.add_argument("--outdir", type=str, default="runs", help="output dir for checkpoints & logs")
@@ -351,6 +363,46 @@ def main():
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"Device: {device}")
+
+    # -------- Eval frozen-only path (skip P1/P2) --------
+    if args_cli.eval_frozen:
+        # Force inference path: use AAPLinearInference modules
+        args.use_aap_linear_training = False
+        args.use_aap_linear_inference = True
+        from models import ECC_Transformer  # already imported at top; keep for clarity in this block
+        import torch.nn as nn
+        from quantize import AAPLinearInference
+        infer_model = ECC_Transformer(args).to(device)
+        # 載入 frozen checkpoint 的 state_dict，並先處理 *.s_w 參數
+        ckpt_path = args_cli.eval_frozen
+        if not (ckpt_path and os.path.isfile(ckpt_path)):
+            logging.error(f"[eval_frozen] File not found: {ckpt_path}")
+            return
+        sd = torch.load(ckpt_path, map_location="cpu")
+
+        # 1) 先在模型中「預先註冊」所有需要的 s_w（dummy），讓 key 對得上
+        model_dev = next(infer_model.parameters()).device
+        for mod_name, mod in infer_model.named_modules():
+            if isinstance(mod, AAPLinearInference):
+                sw_key = f"{mod_name}.s_w"
+                if sw_key in sd:
+                    # 若尚未有 s_w，先以 1.0 作為 placeholder 註冊，再覆寫
+                    if not hasattr(mod, "s_w"):
+                       mod.register_parameter("s_w", nn.Parameter(torch.ones_like(sd[sw_key]).to(model_dev), requires_grad=False))
+        # 2) 現在可以嚴格載入（包含 *.s_w）
+        infer_model.load_state_dict(sd, strict=True)
+        logging.info(f"Loaded checkpoint: {ckpt_path} (strict=True)")
+        # 載入後再保險搬一次，確保 *.s_w 也在正確裝置
+        infer_model.to(device)
+        # 只建立測試集 dataloaders；訓練集無需使用
+        _, test_loader_list, ebn0_list = make_dataloaders(
+            args, runlen_train=0, ebn0_test_list=(4, 5, 6)
+        )
+        test(infer_model, device,
+             wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix="EvalFrozen"),
+             ebn0_list, min_FER=100)
+        logging.info("Done.")
+        return
 
     epochs1 = args_cli.epochs1
     epochs2 = args_cli.epochs2
