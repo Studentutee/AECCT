@@ -58,7 +58,8 @@ class ActivationTracer:
         self._raw_cache = defaultdict(list) if self.sample_merge else None
 
     def log(self, name: str, t: torch.Tensor):
-        stats = _basic_stats(t)
+        # 統計：用安全拷貝（不綁 autograd、不占 GPU）
+        stats = _basic_stats(t.detach())
         if stats:
             self.buff[name].append(stats)
 
@@ -109,108 +110,31 @@ class ActivationTracer:
 # 在 main.py 或 trace_utils.py 後面
 def install_detailed_hooks(model, tracer: "ActivationTracer"):
     """
-    新增「細分」trace（Softmax 前/後、head 合併前/後、LayerNorm in/out、ReLU in/out、以及 [|y|, s(y)] 輸入與 LPE 串接）。
+    非侵入式：只裝 hooks，不改任何函式。更細的 scores/softmax/context、pre-concat
+    由原生程式碼內部透過 _tracer 條件式紀錄（見 models.py）。
     """
-    import types, math, torch, torch.nn.functional as F
+    import torch
     if getattr(model, "_tracer_detailed_installed", False):
         return
-
-    # ---------- 0) 記錄 [|y|, s(y)] 與 embedding / LPE 串接 ----------
-    orig_forward = model.forward
-    def fwd_with_input_trace(self, magnitude, syndrome):
-        # [|y|, s(y)]（列Row對應節點維度；行Column對應 batch 維度）
-        tracer.log("input/abs_y", magnitude)
-        tracer.log("input/syndrome", syndrome)
-        # [|y|, 1-2s(y)] 論文定義的模型實際輸入 h(y)
-        h_y = torch.cat([magnitude, syndrome], dim=-1)
-        tracer.log("input/h_y", h_y)
-        # embedding 前乘法輸入（node_embed_before_cat）
-        emb0 = torch.cat([magnitude, syndrome], dim=-1).unsqueeze(-1)
-        node_embed = self.src_embed.unsqueeze(0) * emb0
-        tracer.log("embed/node_embed", node_embed)
-
-        # LPE 串接前/後
-        lpe = self.lpe_proj(self.lpe)
-        lpe = self.attn_lpe(lpe).unsqueeze(0)
-        bached_lpe = lpe.expand(node_embed.size(0), lpe.size(1), lpe.size(2))
-        tracer.log("embed/lpe_after_proj_attn", bached_lpe)
-        emb_cat = torch.cat([node_embed, bached_lpe], dim=-1)
-        tracer.log("embed/plus_SPE", emb_cat)
-
-        # 照原本 forward 邏輯重做（避免重複計算，直接複用原 forward）
-        return orig_forward(magnitude, syndrome)
-    model.forward = types.MethodType(fwd_with_input_trace, model)
 
     # ---------- 1) Attention 細分（scores → softmax → context） ----------
     for li, layer in enumerate(model.decoder.layers):
         attn = layer.self_attn
         ffn  = layer.feed_forward
 
-        # === 新增：記錄「進入 W_q / W_k / W_v 之前」的量化輸入 quant(x) 與 s_x（每層） ===
-        # attn.linears: [0]=W_q, [1]=W_k, [2]=W_v, [3]=W_o
-        from quantize import abs_max_quantization
-        _names = ["Wq", "Wk", "Wv"]
-        for lj, proj in enumerate(attn.linears[:3]):  # 只包前三個：Q/K/V
-            _orig_fwd = proj.forward
-            def _wrap_WqkV_forward(self_, x, li=li, lj=lj):
-                try:
-                    # 一律用 dequantize=False 取真正整數 quant(x) 與 scale s_x
-                    q_x, s_x = abs_max_quantization(x, dequantize=False, bits=getattr(self_, "act_bits", 8))
-                    tracer.log(f"layer{li}/attn/{_names[lj]}/act_q", q_x)  # 整數化的輸入（進入 W_q/W_k/W_v）
-                    tracer.log(f"layer{li}/attn/{_names[lj]}/s_x",   s_x)  # activation scale
-                except Exception:
-                    pass
-                return _orig_fwd(x)  # 照原邏輯跑
-            proj.forward = _wrap_WqkV_forward.__get__(proj, type(proj))
+        # 將 tracer 交給注意力/FFN，讓它們在原生程式碼內部條件式紀錄
+        setattr(attn, "_tracer", tracer)
+        setattr(ffn,  "_tracer", tracer)
 
-        # === 新增：記錄「進入 W_o 之前」的量化輸入 quant(x) 與 s_x（每層一次） ===
-        # attn.linears 的順序為：lin0=Q, lin1=K, lin2=V, lin3=Out(W_o)
+        # Wo：只用 hook，完全不包 forward
         Wo = attn.linears[-1]
-        _orig_Wo_forward = Wo.forward
-        def _wrap_Wo_forward(self_, x, li=li):
-            # 不改原運算路徑；僅記錄 quant(x) 與 s_x
-            try:
-                from quantize import abs_max_quantization
-                # 一律用 dequantize=False 取得真正的整數輸入 q_x 與縮放 s_x
-                q_x, s_x = abs_max_quantization(x, dequantize=False, bits=getattr(self_, "act_bits", 8))
-                tracer.log(f"layer{li}/attn/Wo/act_q", q_x)  # 進入 W_o 的量化後輸入（整數）
-                tracer.log(f"layer{li}/attn/Wo/s_x",   s_x)  # 對應的 activation scale
-            except Exception:
-                pass
-            return _orig_Wo_forward(x)
-        Wo.forward = _wrap_Wo_forward.__get__(Wo, type(Wo))
 
-        # (a) Q/K/V projection 輸出（延續舊行為）
+        # (a) Q/K/V projection 輸出（forward hook）
         for idx, proj in enumerate(attn.linears[:3]):
             proj.register_forward_hook(lambda m, inp, out, li=li, idx=idx:
                 tracer.log(f"layer{li}/attn/{['Q','K','V'][idx]}", out))
 
-        # (b) 取代 attention()，把 scores / softmax / context 全記下
-        orig_attention = attn.attention
-        def attention_hooked(self_, q, k, v, mask):
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self_.d_k)
-            tracer.log(f"layer{li}/attn/scores_in", scores)
-            if mask is not None:
-                scores = scores.masked_fill(mask.bool(), torch.finfo(scores.dtype).min)
-            p_attn = F.softmax(scores, dim=-1)
-            tracer.log(f"layer{li}/attn/softmax_out", p_attn)
-            context = torch.matmul(p_attn, v)
-            tracer.log(f"layer{li}/attn/context", context)
-            if self_.dropout is not None:
-                p_attn = self_.dropout(p_attn)
-            return context, p_attn
-        attn.attention = types.MethodType(attention_hooked, attn)
-
-        # (c) 取代 hpsa()，記錄 head 合併前/後（pre/post concat）
-        orig_hpsa = attn.hpsa
-        def hpsa_hooked(self_, q, k, v, mask):
-            out, attn_map = orig_hpsa(q, k, v, mask)
-            # 這裡的 out = [B, H, N, Dh] 經轉置後才 concat；我們把「concat 前」先存（各 head 維度）
-            tracer.log(f"layer{li}/attn/pre_concat", out)
-            return out, attn_map
-        attn.hpsa = types.MethodType(hpsa_hooked, attn)
-
-        # (d) 最後線性投影前（post_concat）與投影後（原本就有 attn/out）
+        # (d) 最後線性投影前（post_concat）與投影後：用 pre/post hook
         attn.linears[-1].register_forward_pre_hook(lambda m, inp, li=li:
             tracer.log(f"layer{li}/attn/post_concat", inp[0]))
         attn.linears[-1].register_forward_hook(lambda m, inp, out, li=li:
@@ -239,7 +163,9 @@ def install_detailed_hooks(model, tracer: "ActivationTracer"):
             tracer.log(f"layer{li}/ffn/w1_out", w1)
             tracer.log(f"layer{li}/ffn/w2_out", out)
             return out
-        ffn.forward = types.MethodType(ffn_forward_hooked, ffn)
+        # FFN：只用 hook，不改 forward
+        ffn.w_1.register_forward_hook(lambda m, inp, out, li=li: tracer.log(f"layer{li}/ffn/relu_in", out))
+        ffn.w_2.register_forward_hook(lambda m, inp, out, li=li: tracer.log(f"layer{li}/ffn/w2_out", out))
 
     # Encoder 結尾 LayerNorm（Post-LN）的 in/out
     enc = model.decoder

@@ -105,13 +105,22 @@ class MultiHeadedAttention(nn.Module):
     def attention(self, q, k, v, mask):
         scores = torch.matmul(q, k.transpose(-2, -1)) \
             / math.sqrt(self.d_k)
+        # ====== 安全紀錄（不改數學路徑）======
+        tr = getattr(self, "_tracer", None)
+        if tr is not None:
+            tr.log("attn/scores_in", scores)
         if mask is not None:
             # use dtype-aware minimum to avoid overflow in FP16/FP8 autocast
             scores = scores.masked_fill(mask.bool(), torch.finfo(scores.dtype).min)
         p_attn = F.softmax(scores, dim=-1)
+        if tr is not None:
+            tr.log("attn/softmax_out", p_attn)
         if self.dropout is not None:
             p_attn = self.dropout(p_attn)
-        return torch.matmul(p_attn, v), p_attn
+        context = torch.matmul(p_attn, v)
+        if tr is not None:
+            tr.log("attn/context", context)
+        return context, p_attn
 
     def hpsa(self, q, k, v, mask):
         variable_to_variable_mask = mask[:, :, :self.num_variable_nodes, :self.num_variable_nodes]
@@ -150,6 +159,10 @@ class MultiHeadedAttention(nn.Module):
         first_ring_heads = torch.cat([first_ring_valiable_nodes, first_ring_check_nodes], dim=2)
         second_ring_heads = torch.cat([second_ring_variable_nodes, second_ring_check_nodes], dim=2)
         context = torch.cat([first_ring_heads, second_ring_heads], dim=1)
+        # 在 head 合併前（Row=token，Column=head）記錄 pre-concat
+        tr = getattr(self, "_tracer", None)
+        if tr is not None:
+            tr.log("attn/pre_concat", context)
 
         # create attention map
         first_ring_heads_v = torch.cat([torch.zeros_like(v_to_v_attn), v_to_c_attn], dim=-1)

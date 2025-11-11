@@ -354,6 +354,12 @@ def main():
     args.path = os.path.join(args_cli.outdir, timestr)
     os.makedirs(args.path, exist_ok=True)
 
+    # ---- 把 trace 相關參數放進 args（在 eval_frozen 之前就要完成）----
+    args.trace = getattr(args_cli, "trace", False)
+    args.trace_dir = getattr(args_cli, "trace_dir", None)
+    args.trace_tag = getattr(args_cli, "trace_tag", None)
+    args.trace_sample_raw_every = getattr(args_cli, "trace_sample_raw_every", 0)
+
     code = Code(n=args_cli.n, k=args_cli.k, code_type=args_cli.code_type)
     G, H = Get_Generator_and_Parity(code, standard_form=args_cli.standardize)
     code.generator_matrix = torch.from_numpy(G).transpose(0, 1).long()
@@ -372,6 +378,7 @@ def main():
         from models import ECC_Transformer  # already imported at top; keep for clarity in this block
         import torch.nn as nn
         from quantize import AAPLinearInference
+        from trace_utils import ActivationTracer, install_detailed_hooks
         infer_model = ECC_Transformer(args).to(device)
         # 載入 frozen checkpoint 的 state_dict，並先處理 *.s_w 參數
         ckpt_path = args_cli.eval_frozen
@@ -394,23 +401,31 @@ def main():
         logging.info(f"Loaded checkpoint: {ckpt_path} (strict=True)")
         # 載入後再保險搬一次，確保 *.s_w 也在正確裝置
         infer_model.to(device)
+
+        # ---- 若使用者開了 --trace，建立 tracer 並安裝細部 hooks ----
+        tracer = None
+        if args.trace:
+            trace_dir = args.trace_dir or os.path.join(args.path, "trace_infer")
+            tracer = ActivationTracer(
+                save_dir=trace_dir,
+                sample_raw_every=args.trace_sample_raw_every,
+                sample_merge=False
+            )
+            install_detailed_hooks(infer_model, tracer)
+
         # 只建立測試集 dataloaders；訓練集無需使用
         _, test_loader_list, ebn0_list = make_dataloaders(
             args, runlen_train=0, ebn0_test_list=(4, 5, 6)
         )
-        test(infer_model, device,
-             wrap_loaders_with_tqdm(test_loader_list, ebn0_list, prefix="EvalFrozen"),
-             ebn0_list, min_FER=100)
+        test(infer_model, device, test_loader_list, ebn0_list,
+             min_FER=100, tracer=tracer)
+        if tracer is not None:
+            tracer.dump(tag=args.trace_tag or "infer")
         logging.info("Done.")
         return
 
     epochs1 = args_cli.epochs1
     epochs2 = args_cli.epochs2
-
-    args.trace = getattr(args_cli, "trace", False)
-    args.trace_dir = getattr(args_cli, "trace_dir", None)
-    args.trace_tag = getattr(args_cli, "trace_tag", None)
-    args.trace_sample_raw_every = getattr(args_cli, "trace_sample_raw_every", 0)
 
     p1_ckpt = ""
     if args_cli.enable_p1:
