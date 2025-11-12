@@ -304,6 +304,12 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=N
                         # mimic model.loss's x_pred branch without computing BCE
                         x_pred = ( -z_pred * torch.sign(y) > 0 ).float()
 
+                    # ====== 安全 trace 最終輸出／硬判決／標籤 ======
+                    if tracer is not None:
+                        tracer.log("output/logits", z_pred)   # 最終輸出（logits）
+                        tracer.log("output/x_pred", x_pred)   # 硬判決 (0/1)
+                        tracer.log("target/x", x_dev)         # 目標 (0/1)
+
                     if end_ev is not None:
                         end_ev.record()
                         torch.cuda.synchronize()

@@ -122,9 +122,11 @@ def install_detailed_hooks(model, tracer: "ActivationTracer"):
         attn = layer.self_attn
         ffn  = layer.feed_forward
 
-        # 將 tracer 交給注意力/FFN，讓它們在原生程式碼內部條件式紀錄
+        # 將 tracer 與層索引一起交給注意力/FFN
         setattr(attn, "_tracer", tracer)
-        setattr(ffn,  "_tracer", tracer)
+        setattr(attn, "_layer_id", li)
+        setattr(ffn, "_tracer", tracer)
+        setattr(ffn, "_layer_id", li)
 
         # Wo：只用 hook，完全不包 forward
         Wo = attn.linears[-1]
@@ -151,18 +153,6 @@ def install_detailed_hooks(model, tracer: "ActivationTracer"):
         layer.sublayer[1].norm.register_forward_hook(lambda m, inp, out, li=li:
             tracer.log(f"layer{li}/norm/ffn_out", out))
 
-        # ---------- 3) FFN 的 ReLU 前/後 ----------
-        orig_ffn_forward = ffn.forward
-        def ffn_forward_hooked(self_, x):
-            w1 = self_.w_1(x)
-            tracer.log(f"layer{li}/ffn/relu_in", w1)
-            r  = F.relu(w1)
-            tracer.log(f"layer{li}/ffn/relu_out", r)
-            r  = self_.dropout(r)
-            out = self_.w_2(r)
-            tracer.log(f"layer{li}/ffn/w1_out", w1)
-            tracer.log(f"layer{li}/ffn/w2_out", out)
-            return out
         # FFN：只用 hook，不改 forward
         ffn.w_1.register_forward_hook(lambda m, inp, out, li=li: tracer.log(f"layer{li}/ffn/relu_in", out))
         ffn.w_2.register_forward_hook(lambda m, inp, out, li=li: tracer.log(f"layer{li}/ffn/w2_out", out))
@@ -180,5 +170,21 @@ def install_detailed_hooks(model, tracer: "ActivationTracer"):
             tracer.log("encoder/norm_mid_in", inp[0]))
         enc.norm2.register_forward_hook(lambda m, inp, out:
             tracer.log("encoder/norm_mid_out", out))
+
+    # ---------- 4) 最終輸出路徑：oned_final_embed -> out_fc（logits） ----------
+    if hasattr(model, "oned_final_embed"):
+        model.oned_final_embed.register_forward_pre_hook(
+            lambda m, inp: tracer.log("output/oned_final_embed_in", inp[0])
+        )
+        model.oned_final_embed.register_forward_hook(
+            lambda m, inp, out: tracer.log("output/oned_final_embed_out", out)
+        )
+    if hasattr(model, "out_fc"):
+        model.out_fc.register_forward_pre_hook(
+            lambda m, inp: tracer.log("output/out_fc_in", inp[0])
+        )
+        model.out_fc.register_forward_hook(
+            lambda m, inp, out: tracer.log("output/logits", out)
+        )
 
     setattr(model, "_tracer_detailed_installed", True)
