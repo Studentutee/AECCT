@@ -152,12 +152,58 @@ class MultiHeadedAttention(nn.Module):
         first_ring_check_nodes, c_to_v_attn = self.attention(q_check, k_variable, v_variable, variable_to_check_mask.transpose(-2, -1))
 
         # second ring
-        q_variable, q_check = split_variable_and_check_nodes(query_second_ring_heads)
-        k_variable, k_check = split_variable_and_check_nodes(key_second_ring_heads)
-        v_variable, v_check = split_variable_and_check_nodes(value_second_ring_heads)
+        q_variable2, q_check2 = split_variable_and_check_nodes(query_second_ring_heads)
+        k_variable2, k_check2 = split_variable_and_check_nodes(key_second_ring_heads)
+        v_variable2, v_check2 = split_variable_and_check_nodes(value_second_ring_heads)
 
-        second_ring_variable_nodes, v_to_v_attn = self.attention(q_variable, k_variable, v_variable, variable_to_variable_mask)
-        second_ring_check_nodes, c_to_c_attn = self.attention(q_check, k_check, v_check, check_to_check_mask)
+        second_ring_variable_nodes, v_to_v_attn = self.attention(q_variable2, k_variable2, v_variable2, variable_to_variable_mask)
+        second_ring_check_nodes, c_to_c_attn   = self.attention(q_check2,    k_check2,    v_check2,    check_to_check_mask)
+
+        # === NEW (per-head trace) : save 4 sub-blocks and full 46×46 per head ===
+        tr = getattr(self, "_tracer", None)
+        li = getattr(self, "_layer_id", None)
+        if tr is not None:
+            # first-ring q/k（from the already-split first-ring heads）
+            q_variable1, q_check1 = split_variable_and_check_nodes(query_first_ring_heads)
+            k_variable1, k_check1 = split_variable_and_check_nodes(key_first_ring_heads)
+
+            B  = q.size(0)
+            Nv = self.num_variable_nodes
+            T  = q.size(2)                       # total nodes = Nv + Nc
+            Nc = T - Nv
+            Hf = query_first_ring_heads.size(1)  # first-ring heads
+            Hs = query_second_ring_heads.size(1) # second-ring heads
+            scale = 1.0 / math.sqrt(self.d_k)
+
+            # pre-softmax score sub-blocks (with head dim)
+            s_vc = torch.matmul(q_variable1, k_check1.transpose(-2, -1)) * scale    # [B,Hf,Nv,Nc]
+            s_cv = torch.matmul(q_check1,   k_variable1.transpose(-2, -1)) * scale  # [B,Hf,Nc,Nv]
+            s_vv = torch.matmul(q_variable2, k_variable2.transpose(-2, -1)) * scale # [B,Hs,Nv,Nv]
+            s_cc = torch.matmul(q_check2,    k_check2.transpose(-2, -1)) * scale    # [B,Hs,Nc,Nc]
+
+            base = f"layer{li}/attn" if li is not None else "attn"
+
+            # ---- First-ring heads: h = 0..Hf-1
+            for h in range(Hf):
+                # 子區塊：Row/Colume 註明
+                tr.log(f"{base}/scores_in/v_to_c/h{h}", s_vc[:, h])  # Row=Nv, Colume=Nc
+                tr.log(f"{base}/scores_in/c_to_v/h{h}", s_cv[:, h])  # Row=Nc, Colume=Nv
+                # 完整 46×46（未定義區塊以 -inf 填充）
+                full = torch.full((B, T, T), float("-inf"), device=s_vc.device, dtype=s_vc.dtype)
+                full[:, :Nv, Nv:] = s_vc[:, h]   # top-right: v→c
+                full[:, Nv:, :Nv] = s_cv[:, h]   # bottom-left: c→v
+                tr.log(f"{base}/scores_in_full/h{h}", full)          # [B, 46, 46]（Row×Colume）
+
+            # ---- Second-ring heads: h = Hf..Hf+Hs-1
+            for h in range(Hs):
+                hid = Hf + h
+                tr.log(f"{base}/scores_in/v_to_v/h{hid}", s_vv[:, h])  # Row=Nv, Colume=Nv
+                tr.log(f"{base}/scores_in/c_to_c/h{hid}", s_cc[:, h])  # Row=Nc, Colume=Nc
+                full = torch.full((B, T, T), float("-inf"), device=s_vv.device, dtype=s_vv.dtype)
+                full[:, :Nv, :Nv] = s_vv[:, h]    # top-left: v↔v
+                full[:, Nv:, Nv:] = s_cc[:, h]    # bottom-right: c↔c
+                tr.log(f"{base}/scores_in_full/h{hid}", full)          # [B, 46, 46]
+        # === NEW END ===
 
         # merge
         first_ring_heads = torch.cat([first_ring_valiable_nodes, first_ring_check_nodes], dim=2)
