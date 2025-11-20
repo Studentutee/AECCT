@@ -131,12 +131,18 @@ def install_detailed_hooks(model, tracer: "ActivationTracer"):
         # Wo：只用 hook，完全不包 forward
         Wo = attn.linears[-1]
 
-        # (a) Q/K/V projection 輸出（forward hook）
+        # (a) Q/K/V projection：掛 tracer 與角色，並記輸出
         for idx, proj in enumerate(attn.linears[:3]):
+            setattr(proj, "_tracer", tracer)
+            setattr(proj, "_layer_id", li)
+            setattr(proj, "_trace_role", ["Q","K","V"][idx])
             proj.register_forward_hook(lambda m, inp, out, li=li, idx=idx:
                 tracer.log(f"layer{li}/attn/{['Q','K','V'][idx]}", out))
 
-        # (d) 最後線性投影前（post_concat）與投影後：用 pre/post hook
+        # (d) Wo（合併後線性）：標註角色 + pre/post
+        setattr(attn.linears[-1], "_tracer", tracer)
+        setattr(attn.linears[-1], "_layer_id", li)
+        setattr(attn.linears[-1], "_trace_role", "Wo")
         attn.linears[-1].register_forward_pre_hook(lambda m, inp, li=li:
             tracer.log(f"layer{li}/attn/post_concat", inp[0]))
         attn.linears[-1].register_forward_hook(lambda m, inp, out, li=li:
@@ -153,8 +159,16 @@ def install_detailed_hooks(model, tracer: "ActivationTracer"):
         layer.sublayer[1].norm.register_forward_hook(lambda m, inp, out, li=li:
             tracer.log(f"layer{li}/norm/ffn_out", out))
 
-        # FFN：只用 hook，不改 forward
-        ffn.w_1.register_forward_hook(lambda m, inp, out, li=li: tracer.log(f"layer{li}/ffn/relu_in", out))
+        # FFN：標註角色 + 仍用 hook 記出入
+        setattr(ffn.w_1, "_tracer", tracer); setattr(ffn.w_1, "_layer_id", li); setattr(ffn.w_1, "_trace_role", "w1")
+        setattr(ffn.w_2, "_tracer", tracer); setattr(ffn.w_2, "_layer_id", li); setattr(ffn.w_2, "_trace_role", "w2")
+        def _ffn_w1_hook(m, inp, out, li=li, tracer=tracer):
+            # out == w1(x) → 這就是 ReLU 的輸入
+            tracer.log(f"layer{li}/ffn/relu_in", out)
+            # 直接在 hook 裡計算 ReLU 輸出（不改模型路徑，只做記錄）
+            relu_out = torch.nn.functional.relu(out)
+            tracer.log(f"layer{li}/ffn/relu_out", relu_out)  # 形狀: [B, 列(Row)=46, 行(Colume)=w1輸出維度]
+        ffn.w_1.register_forward_hook(_ffn_w1_hook)
         ffn.w_2.register_forward_hook(lambda m, inp, out, li=li: tracer.log(f"layer{li}/ffn/w2_out", out))
 
     # Encoder 結尾 LayerNorm（Post-LN）的 in/out

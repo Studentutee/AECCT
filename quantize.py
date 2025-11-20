@@ -79,19 +79,37 @@ class AAPLinearTraining(torch.nn.Linear):
             initial_percentile=self.initial_percentile,
             delta=self.delta,
         )
+        # ---- Trace (training-only): act_q & w_q ----
+        tr = getattr(self, "_tracer", None)
+        li = getattr(self, "_layer_id", None)
+        role = getattr(self, "_trace_role", None)
+        if tr is not None and role is not None:
+            prefix = f"layer{li}/attn/{role}" if role in ["Q","K","V","Wo"] else f"layer{li}/ffn/{role}"
+            tr.log(f"{prefix}/act_q", noisy_x)
+            tr.log(f"{prefix}/w_q",   self.noisy_w)
+            tr.log(f"{prefix}/delta", self.delta)
         return F.linear(input=noisy_x, weight=self.noisy_w, bias=self.bias)
 
 
 class AAPLinearInference(AAPLinearTraining):
     def forward(self, x):
         q_w = self.weight
-
         q_x, s_x = abs_max_quantization(x, dequantize=False, bits=self.act_bits)
-        
         q_out = F.linear(input=q_x, weight=q_w)
         sw = self.s_w if self.s_w.device == q_out.device else self.s_w.to(q_out.device)
         fp_out = q_out / (s_x * sw)
         if self.bias is not None:
             fp_out = fp_out + self.bias
+        # ---- Trace (inference): s_x / s_w / q_x / q_out / fp_out ----
+        tr = getattr(self, "_tracer", None)
+        li = getattr(self, "_layer_id", None)
+        role = getattr(self, "_trace_role", None)
+        if tr is not None and role is not None:
+            prefix = f"layer{li}/attn/{role}" if role in ["Q","K","V","Wo"] else f"layer{li}/ffn/{role}"
+            tr.log(f"{prefix}/s_x",   s_x)
+            tr.log(f"{prefix}/s_w",   sw)
+            tr.log(f"{prefix}/act_q", q_x)
+            tr.log(f"{prefix}/out_q", q_out)
+            tr.log(f"{prefix}/out_fp", fp_out)
         return fp_out
 
