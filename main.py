@@ -418,7 +418,13 @@ def main():
             args, runlen_train=0, ebn0_test_list=(4, 5, 6)
         )
         test(infer_model, device, test_loader_list, ebn0_list,
-             min_FER=100, tracer=tracer)
+             min_FER=100, tracer=tracer,
+             precision=args_cli.test_precision,
+             measure_tp=args_cli.measure_tp,
+             warmup=args_cli.warmup,
+             tp_include_loss=args_cli.tp_include_loss,
+             fp8_native=args_cli.fp8_native,
+             fp32_strict=args_cli.fp32_strict)
         if tracer is not None:
             tracer.dump(tag=args.trace_tag or "infer")
         logging.info("Done.")

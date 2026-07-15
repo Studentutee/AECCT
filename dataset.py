@@ -244,10 +244,11 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=N
     test_loss_list, test_loss_ber_list, test_loss_fer_list, cum_samples_all = [], [], [], []
     t = time.time()
 
-    # Throughput accumulators
+    # Throughput / latency accumulators
     total_ms = 0.0
     total_samples_for_tp = 0
     seen_batches = 0
+    batch_latencies_ms = []
     start_ev = torch.cuda.Event(enable_timing=True) if (measure_tp and torch.cuda.is_available()) else None
     end_ev   = torch.cuda.Event(enable_timing=True) if (measure_tp and torch.cuda.is_available()) else None
 
@@ -314,8 +315,10 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=N
                         end_ev.record()
                         torch.cuda.synchronize()
                         if seen_batches >= warmup:
-                            total_ms += start_ev.elapsed_time(end_ev)
+                            elapsed = start_ev.elapsed_time(end_ev)
+                            total_ms += elapsed
                             total_samples_for_tp += x.shape[0]
+                            batch_latencies_ms.append(elapsed)
                         seen_batches += 1
 
                     if tracer is not None:
@@ -364,6 +367,12 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100, tracer=N
         logging.info(f"[Throughput] GPU forward-only: {sps:.2f} samples/s "
                      f"(ignored first {warmup} batches; "
                      f"{'incl. loss' if tp_include_loss else 'excl. loss'})")
+        lat = np.array(batch_latencies_ms)
+        logging.info(f"[Latency]    mean={np.mean(lat):.3f} ms  "
+                     f"p50={np.percentile(lat, 50):.3f} ms  "
+                     f"p95={np.percentile(lat, 95):.3f} ms  "
+                     f"p99={np.percentile(lat, 99):.3f} ms  "
+                     f"(per batch, {len(lat)} batches)")
 
     logging.info(f'# of testing samples: {cum_samples_all}\n Test Time {time.time() - t} s\n')
     return test_loss_list, test_loss_ber_list, test_loss_fer_list
